@@ -23,7 +23,9 @@ import re
 
 import frappe
 from frappe import _
-from frappe.utils import flt, nowdate, now
+from frappe.utils import flt, nowdate, now, getdate, escape_html
+from frappe.rate_limiter import rate_limit
+from frappe.contacts.doctype.address.address import get_address_display
 
 
 # =========================================================================
@@ -32,12 +34,90 @@ from frappe.utils import flt, nowdate, now
 # app ke internal hook/override ko bhi bypass kar deta hai).
 # =========================================================================
 def _run_as_admin(fn, *args, **kwargs):
-    original_user = frappe.session.user
+    """Run fn with Administrator permissions WITHOUT damaging the caller's session.
+
+    frappe.set_user() is not a harmless switch. It overwrites session.sid with the
+    user name, replaces session.data with an empty dict (dropping the CSRF token,
+    IP, user agent ...) and wipes form_dict. Frappe then saves that damaged
+    session back to the database/cache after the response. So everything
+    set_user touches is snapshotted here and put back exactly, even if fn fails.
+    """
+    session = frappe.local.session
+    saved_user, saved_sid, saved_data = session.user, session.sid, session.data
+    saved_form_dict = frappe.local.form_dict
+
     frappe.set_user("Administrator")
     try:
         return fn(*args, **kwargs)
     finally:
-        frappe.set_user(original_user)
+        frappe.set_user(saved_user)
+        session = frappe.local.session
+        session.sid = saved_sid
+        session.data = saved_data
+        frappe.local.form_dict = saved_form_dict
+
+
+# =========================================================================
+# STAFF CHECK
+# Counter (offline) payment modes may only be recorded by staff. Being merely
+# "logged in" is not enough (portal/website users are logged in too), so we
+# check for an accounts-type role. Override per site with:
+#   bench set-config donation_staff_roles '["Accounts User","Donation Clerk"]' --parse
+# =========================================================================
+STAFF_ROLES = ("System Manager", "Accounts Manager", "Accounts User")
+
+
+def _is_staff(user=None):
+    user = user or frappe.session.user
+    if user == "Guest":
+        return False
+    allowed = set(frappe.conf.get("donation_staff_roles") or STAFF_ROLES)
+    return bool(allowed & set(frappe.get_roles(user)))
+
+
+def _staff_required():
+    """Raise the right error: anonymous callers learn nothing, but a logged-in
+    user who lacks the role is told exactly what is missing."""
+    if frappe.session.user == "Guest":
+        frappe.throw(_("Not permitted"), frappe.PermissionError)
+    roles = ", ".join(sorted(set(frappe.conf.get("donation_staff_roles") or STAFF_ROLES)))
+    frappe.throw(
+        _("Your user ({0}) cannot record counter or in-kind donations. It needs one of these roles: {1}")
+        .format(frappe.session.user, roles),
+        frappe.PermissionError,
+    )
+
+
+@frappe.whitelist(allow_guest=True)
+def is_donation_staff():
+    """The donation page asks this once, so it only offers the counter payment
+    modes to users the server would actually accept."""
+    return _is_staff()
+
+
+# =========================================================================
+# PAYMENT MODES
+#   mop        : Mode of Payment master name (auto-created if missing)
+#   mop_type   : Mode of Payment "type"
+#   account    : where the "Paid To" account comes from
+#                  cash -> Company default cash account
+#                  bank -> Company default bank account (falls back to cash)
+#                  mop  -> Mode of Payment > Accounts table row for the company
+#   ref_*      : bank-type modes need a reference number + date (cheque no,
+#                UTR, ...). Others get an auto-generated reference.
+# =========================================================================
+PAYMENT_MODES = {
+    "Online": {"mop": "Online Payment", "mop_type": "Bank", "account": "bank", "prefix": "DEMO-"},
+    "Cash": {"mop": "Cash", "mop_type": "Cash", "account": "cash", "prefix": "CASH-"},
+    "Cheque": {"mop": "Cheque", "mop_type": "Bank", "account": "bank",
+               "ref_required": True, "ref_label": "Cheque number", "date_label": "Cheque date"},
+    "RTGS": {"mop": "RTGS", "mop_type": "Bank", "account": "bank",
+             "ref_required": True, "ref_label": "UTR / reference number", "date_label": "Transfer date"},
+    "NEFT": {"mop": "NEFT", "mop_type": "Bank", "account": "bank",
+             "ref_required": True, "ref_label": "UTR / reference number", "date_label": "Transfer date"},
+    "Donation In Kind": {"mop": "Donation In Kind", "mop_type": "General", "account": "mop",
+                         "prefix": "INKIND-"},
+}
 
 
 # =========================================================================
@@ -76,18 +156,155 @@ def get_purpose_list(trust):
 # =========================================================================
 @frappe.whitelist(allow_guest=True)
 def create_donation(donor_name, mobile, email, trust, amount, pan=None,
-                     aadhaar=None, purpose=None, purpose_label=None):
+                     aadhaar=None, purpose=None, purpose_label=None,
+                     address_line1=None, address_line2=None, city=None,
+                     state=None, pincode=None, in_kind_details=None):
+    # Decide "is this a staff member?" on the REAL caller, before
+    # _run_as_admin swaps the session user to Administrator.
+    is_staff = _is_staff()
+    if (in_kind_details or "").strip() and not is_staff:
+        _staff_required()
     return _run_as_admin(
         _create_donation, donor_name, mobile, email, trust, amount,
         pan, aadhaar, purpose, purpose_label,
+        address_line1, address_line2, city, state, pincode,
+        in_kind_details, is_staff,
     )
 
 
+# =========================================================================
+# DONOR LOOKUP — PAN/Aadhaar se pehle ka donor dhoondh ke naam + address
+# wapas karta hai taaki form auto-fill ho sake.
+#
+# PRIVACY: yeh guest-accessible hai, isliye mobile/email kabhi wapas nahi
+# karte (sirf masked hint) — warna koi bhi PAN guess karke kisi ka contact
+# number nikal sakta hai. Rate-limit bhi laga hai (enumeration rokne ke liye).
+# =========================================================================
+def _mask_mobile(m):
+    m = (m or "").strip()
+    return (m[:2] + "xxxxxx" + m[-2:]) if len(m) >= 6 else ""
+
+
+def _mask_email(e):
+    e = (e or "").strip()
+    if "@" not in e:
+        return ""
+    local, domain = e.split("@", 1)
+    return (local[:2] + "***@" + domain) if local else ""
+
+
+@frappe.whitelist(allow_guest=True)
+@rate_limit(limit=15, seconds=60 * 5)
+def lookup_donor(pan=None, aadhaar=None):
+    # Deliberately NOT run as Administrator: it only reads through frappe.db
+    # (which does not check permissions anyway), and a guest-facing lookup has
+    # no business running with elevated rights or touching the session.
+    return _lookup_donor(pan, aadhaar)
+
+
+def _lookup_donor(pan, aadhaar):
+    pan = (pan or "").strip().upper()
+    aadhaar = (aadhaar or "").strip()
+
+    customer = None
+    if pan and re.match(r"^[A-Z]{5}[0-9]{4}[A-Z]{1}$", pan):
+        customer = frappe.db.get_value("Customer", {"pan": pan}, "name")
+    if not customer and aadhaar and len(aadhaar) == 12 and aadhaar.isdigit():
+        customer = frappe.db.get_value("Customer", {"custom_aadhaar": aadhaar}, "name")
+
+    if not customer:
+        return {"found": False}
+
+    cust = frappe.db.get_value(
+        "Customer", customer,
+        ["customer_name", "mobile_no", "email_id", "pan", "custom_aadhaar"],
+        as_dict=True,
+    )
+
+    # Latest linked Address
+    addr_name = frappe.db.sql(
+        """SELECT a.name FROM `tabAddress` a
+           JOIN `tabDynamic Link` dl ON dl.parent = a.name
+             AND dl.parenttype = 'Address'
+           WHERE dl.link_doctype = 'Customer' AND dl.link_name = %s
+           ORDER BY a.modified DESC LIMIT 1""",
+        customer,
+    )
+    address = {}
+    if addr_name:
+        address = frappe.db.get_value(
+            "Address", addr_name[0][0],
+            ["address_line1", "address_line2", "city", "state", "pincode"],
+            as_dict=True,
+        ) or {}
+
+    return {
+        "found": True,
+        "donor_name": cust.customer_name,
+        # Dusri identity bhi bhar dete hain (PAN diya to Aadhaar, ya ulta)
+        "pan": cust.pan or "",
+        "aadhaar": cust.custom_aadhaar or "",
+        "address_line1": address.get("address_line1") or "",
+        "address_line2": address.get("address_line2") or "",
+        "city": address.get("city") or "",
+        "state": address.get("state") or "",
+        "pincode": address.get("pincode") or "",
+        # Sirf masked hint — asli mobile/email donor ko dobara daalna hai
+        "mobile_hint": _mask_mobile(cust.mobile_no),
+        "email_hint": _mask_email(cust.email_id),
+    }
+
+
+def _get_or_create_address(customer, donor_name, address_line1, address_line2,
+                           city, state, pincode):
+    """Same address (line1 + pincode) pehle se linked ho to wahi use karo,
+    warna naya Address banao aur Customer se link karo."""
+    existing = frappe.db.sql(
+        """SELECT a.name FROM `tabAddress` a
+           JOIN `tabDynamic Link` dl ON dl.parent = a.name
+             AND dl.parenttype = 'Address'
+           WHERE dl.link_doctype = 'Customer' AND dl.link_name = %s
+             AND a.address_line1 = %s AND IFNULL(a.pincode, '') = %s
+           LIMIT 1""",
+        (customer, address_line1, pincode),
+    )
+    if existing:
+        return existing[0][0]
+
+    addr = frappe.get_doc({
+        "doctype": "Address",
+        "address_title": donor_name,
+        "address_type": "Billing",
+        "address_line1": address_line1,
+        "address_line2": address_line2 or None,
+        "city": city,
+        "state": state,
+        "pincode": pincode,
+        "country": "India",
+        "links": [{"link_doctype": "Customer", "link_name": customer}],
+    })
+    addr.insert(ignore_permissions=True)
+    return addr.name
+
+
 def _create_donation(donor_name, mobile, email, trust, amount, pan,
-                      aadhaar, purpose, purpose_label):
+                      aadhaar, purpose, purpose_label,
+                      address_line1, address_line2, city, state, pincode,
+                      in_kind_details=None, is_staff=False):
+    in_kind_details = (in_kind_details or "").strip()
+    if in_kind_details and not is_staff:
+        frappe.throw(_("Not permitted"), frappe.PermissionError)
+    if len(in_kind_details) > 300:
+        frappe.throw(_("In-kind details are too long (max 300 characters)"))
+
     mobile = (mobile or "").strip()
     pan = (pan or "").strip().upper()
     aadhaar = (aadhaar or "").strip()
+    address_line1 = (address_line1 or "").strip()
+    address_line2 = (address_line2 or "").strip()
+    city = (city or "").strip()
+    state = (state or "").strip()
+    pincode = (pincode or "").strip()
     amount = flt(amount)
 
     if amount <= 0:
@@ -107,6 +324,18 @@ def _create_donation(donor_name, mobile, email, trust, amount, pan,
 
     if aadhaar and not (len(aadhaar) == 12 and aadhaar.isdigit()):
         frappe.throw(_("Invalid Aadhaar format (12 digits required)"))
+
+    # ---- Address (client requirement: proper donor address) ----
+    if not (address_line1 and city and state):
+        frappe.throw(_("Address line 1, city and state are required"))
+    if not (len(pincode) == 6 and pincode.isdigit()):
+        frappe.throw(_("Invalid pincode (6 digits required)"))
+
+    # ---- In-kind: make sure the booking account exists BEFORE creating anything.
+    # Otherwise the invoice would be created and then the payment step would
+    # fail, leaving an unpaid invoice behind. ----
+    if in_kind_details:
+        _resolve_paid_to(PAYMENT_MODES["Donation In Kind"], trust)
 
     # ---- Purpose ka trust se match hona chahiye (tampering-proof) ----
     if purpose:
@@ -134,10 +363,29 @@ def _create_donation(donor_name, mobile, email, trust, amount, pan,
         cust.insert(ignore_permissions=True)
         customer = cust.name
     else:
+        # Existing donor: mobile/email hamesha latest wale se update
+        # (donor ne naya daala ho sakta hai), PAN/Aadhaar missing ho to bhar do
         cust_doc = frappe.get_doc("Customer", customer)
         cust_doc.mobile_no = mobile
         cust_doc.email_id = email
+        if pan and not cust_doc.get("pan"):
+            cust_doc.pan = pan
+        if aadhaar and not cust_doc.get("custom_aadhaar"):
+            cust_doc.custom_aadhaar = aadhaar
         cust_doc.save(ignore_permissions=True)
+
+    address_name = _get_or_create_address(
+        customer, donor_name, address_line1, address_line2, city, state, pincode
+    )
+
+    # Print format me doc.address_display use hota hai — explicitly set karo
+    address_display = get_address_display(address_name)
+
+    # The receipt prints the item description, so an in-kind gift is described
+    # right there (e.g. "General Donation - In kind: 5 kg atta").
+    description = purpose_label or "General Donation"
+    if in_kind_details:
+        description += " - In kind: " + in_kind_details
 
     si = frappe.get_doc({
         "doctype": "Sales Invoice",
@@ -145,12 +393,15 @@ def _create_donation(donor_name, mobile, email, trust, amount, pan,
         "company": trust,
         "due_date": nowdate(),
         "is_pos": 0,
+        "customer_address": address_name,
+        "address_display": address_display,
         "items": [{
             "item_code": "Donation",
             "qty": 1,
             "rate": amount,
-            "description": purpose_label or "General Donation",
+            "description": description,
         }],
+        "custom_in_kind_details": in_kind_details or None,
         "custom_donor_mobile": mobile,
         "custom_donor_pan": pan or None,
         "custom_donor_aadhaar": aadhaar or None,
@@ -195,31 +446,86 @@ def _get_donation_receipt_pdf(sales_invoice, mobile):
 # =========================================================================
 @frappe.whitelist(allow_guest=True)
 def make_payment_1(sales_invoice, payment_mode=None, cheque_no=None,
-                    cheque_date=None, bank_name=None):
+                    cheque_date=None, bank_name=None, in_kind_details=None):
+    # NOTE: cheque_no / cheque_date / bank_name are also used for RTGS and NEFT
+    # (UTR number, transfer date, bank) - the names are kept for compatibility.
+    payment_mode = payment_mode or "Online"
+    if payment_mode not in PAYMENT_MODES:
+        frappe.throw(_("Invalid payment mode"))
+
+    # Authorisation uses the REAL caller (before the admin switch below).
+    # Without this check anybody on the internet could mark any invoice as paid.
+    if payment_mode == "Online":
+        # Online payments are confirmed by the gateway (verify_razorpay_payment /
+        # webhook), never by the browser. This path exists only for the
+        # no-gateway demo and must be switched on explicitly:
+        #   bench set-config donation_demo_mode 1
+        if not frappe.conf.get("donation_demo_mode"):
+            frappe.throw(_("Not permitted"), frappe.PermissionError)
+    elif not _is_staff():
+        _staff_required()
+
     return _run_as_admin(
-        _make_payment_1, sales_invoice, payment_mode, cheque_no, cheque_date, bank_name
+        _make_payment_1, sales_invoice, payment_mode, cheque_no, cheque_date,
+        bank_name, in_kind_details,
     )
 
 
-def _make_payment_1(sales_invoice_name, payment_mode, cheque_no, cheque_date, bank_name):
-    payment_mode = payment_mode or "Online"
-    cheque_no = (cheque_no or "").strip()
+def _resolve_paid_to(cfg, company):
+    """Return the account the money (or the goods) is booked to."""
+    if cfg["account"] == "cash":
+        account = frappe.db.get_value("Company", company, "default_cash_account")
+        missing = "a Default Cash Account"
+    elif cfg["account"] == "bank":
+        account = (
+            frappe.db.get_value("Company", company, "default_bank_account")
+            or frappe.db.get_value("Company", company, "default_cash_account")
+        )
+        missing = "a Default Bank Account"
+    else:
+        account = frappe.db.get_value(
+            "Mode of Payment Account",
+            {"parent": cfg["mop"], "company": company},
+            "default_account",
+        )
+        missing = "an account set under Mode of Payment '{0}' > Accounts (add a row for this company)".format(cfg["mop"])
+
+    if not account:
+        frappe.throw(_("Company '{0}' is missing {1}. Please set it up first.").format(company, missing))
+    return account
+
+
+def _make_payment_1(sales_invoice_name, payment_mode, cheque_no, cheque_date,
+                    bank_name, in_kind_details):
+    cfg = PAYMENT_MODES[payment_mode]
+    reference_no = (cheque_no or "").strip()
     bank_name = (bank_name or "").strip()
+    reference_date = cheque_date
 
     if not sales_invoice_name:
         frappe.throw(_("sales_invoice is required"))
 
-    if payment_mode not in ("Online", "Cash", "Cheque"):
-        frappe.throw(_("Invalid payment mode"))
-
-    if payment_mode == "Cheque":
-        if not cheque_no:
-            frappe.throw(_("Cheque number is required"))
-        if not cheque_date:
-            frappe.throw(_("Cheque date is required"))
+    # ---- Reference number / date ----
+    if cfg.get("ref_required"):
+        if not reference_no:
+            frappe.throw(_("{0} is required").format(cfg["ref_label"]))
+        if not reference_date:
+            frappe.throw(_("{0} is required").format(cfg["date_label"]))
+        reference_date = getdate(reference_date)  # raises on a malformed date
+    else:
+        ts = now().replace("-", "").replace(":", "").replace(" ", "").replace(".", "")
+        reference_no = cfg["prefix"] + ts
+        reference_date = nowdate()
 
     si = frappe.get_doc("Sales Invoice", sales_invoice_name)
     print_format_name = frappe.db.get_value("Company", si.company, "custom_print_format") or "Standard"
+
+    # ---- Donation in kind: what was donated must be on record ----
+    details = ""
+    if payment_mode == "Donation In Kind":
+        details = (si.get("custom_in_kind_details") or in_kind_details or "").strip()
+        if not details:
+            frappe.throw(_("Please describe what the donor gave (item and quantity)"))
 
     if si.outstanding_amount <= 0:
         existing_pe = frappe.db.get_value(
@@ -235,42 +541,15 @@ def _make_payment_1(sales_invoice_name, payment_mode, cheque_no, cheque_date, ba
         }
 
     # ---- Mode of Payment auto-create ----
-    mode_of_payment_name = payment_mode if payment_mode != "Online" else "Online Payment"
-    mop_type = "Cash" if payment_mode == "Cash" else "Bank"
-
-    if not frappe.db.exists("Mode of Payment", mode_of_payment_name):
+    if not frappe.db.exists("Mode of Payment", cfg["mop"]):
         frappe.get_doc({
             "doctype": "Mode of Payment",
-            "mode_of_payment": mode_of_payment_name,
-            "type": mop_type,
+            "mode_of_payment": cfg["mop"],
+            "type": cfg["mop_type"],
         }).insert(ignore_permissions=True)
 
-    # ---- Paid To account ----
-    if payment_mode == "Cash":
-        default_account = frappe.db.get_value("Company", si.company, "default_cash_account")
-    else:
-        default_account = (
-            frappe.db.get_value("Company", si.company, "default_bank_account")
-            or frappe.db.get_value("Company", si.company, "default_cash_account")
-        )
-
-    if not default_account:
-        frappe.throw(_(
-            "Company '{0}' me Default {1} Account set nahi hai. "
-            "Company master me Accounts Settings tab me set karein."
-        ).format(si.company, "Cash" if payment_mode == "Cash" else "Bank"))
-
+    paid_to = _resolve_paid_to(cfg, si.company)
     company_currency = frappe.db.get_value("Company", si.company, "default_currency")
-
-    # ---- Reference no / date ----
-    if payment_mode == "Cheque":
-        reference_no = cheque_no
-        reference_date = cheque_date
-    else:
-        ts = now().replace("-", "").replace(":", "").replace(" ", "").replace(".", "")
-        prefix = "CASH-" if payment_mode == "Cash" else "DEMO-"
-        reference_no = prefix + ts
-        reference_date = nowdate()
 
     pe_dict = {
         "doctype": "Payment Entry",
@@ -280,10 +559,10 @@ def _make_payment_1(sales_invoice_name, payment_mode, cheque_no, cheque_date, ba
         "party": si.customer,
         "paid_amount": si.grand_total,
         "received_amount": si.grand_total,
-        "paid_to": default_account,
+        "paid_to": paid_to,
         "reference_no": reference_no,
         "reference_date": reference_date,
-        "mode_of_payment": mode_of_payment_name,
+        "mode_of_payment": cfg["mop"],
         "paid_from_account_currency": si.currency or company_currency,
         "paid_to_account_currency": company_currency,
         "source_exchange_rate": 1,
@@ -294,14 +573,16 @@ def _make_payment_1(sales_invoice_name, payment_mode, cheque_no, cheque_date, ba
             "allocated_amount": si.grand_total,
         }],
     }
-    if payment_mode == "Cheque" and bank_name:
+    if cfg.get("ref_required") and bank_name:
         pe_dict["custom_bank_name"] = bank_name
+    if payment_mode == "Donation In Kind":
+        pe_dict["remarks"] = "Donation in kind: " + details
 
     pe = frappe.get_doc(pe_dict)
     pe.insert(ignore_permissions=True)
     pe.submit()
 
-    email_sent, pdf_attached = _send_receipt_email(si, pe, payment_mode, print_format_name)
+    email_sent, pdf_attached = _send_receipt_email(si, pe, payment_mode, print_format_name, details)
 
     return {
         "status": "success",
@@ -314,7 +595,7 @@ def _make_payment_1(sales_invoice_name, payment_mode, cheque_no, cheque_date, ba
     }
 
 
-def _send_receipt_email(si, pe, payment_mode, print_format_name):
+def _send_receipt_email(si, pe, payment_mode, print_format_name, in_kind_details=""):
     email_sent = False
     pdf_attached = False
 
@@ -334,14 +615,7 @@ def _send_receipt_email(si, pe, payment_mode, print_format_name):
         frappe.sendmail(
             recipients=[customer_email],
             subject="Donation Receipt - {0} | {1}".format(si.name, si.company),
-            message=(
-                "<p>Dear {0},</p>"
-                "<p>Thank you sincerely for your generous donation (Rs. {1}) to <b>{2}</b>.</p>"
-                "<p>Your donation receipt is attached to this email.</p>"
-                "<p>Payment Mode: {3}</p>"
-                "<p>Payment Reference: {4}</p>"
-                "<p>With gratitude,<br>{2}</p>"
-            ).format(si.customer_name, si.grand_total, si.company, payment_mode, pe.reference_no),
+            message=_receipt_email_body(si, pe, payment_mode, in_kind_details),
             attachments=attachments,
             now=True,
         )
@@ -351,3 +625,24 @@ def _send_receipt_email(si, pe, payment_mode, print_format_name):
         email_sent = False
 
     return email_sent, pdf_attached
+
+
+def _receipt_email_body(si, pe, payment_mode, in_kind_details):
+    if payment_mode == "Donation In Kind":
+        intro = (
+            "<p>Thank you sincerely for your generous in-kind donation of "
+            "<b>{0}</b> to <b>{1}</b>, recorded at an equivalent value of Rs. {2}.</p>"
+        ).format(escape_html(in_kind_details), escape_html(si.company), si.grand_total)
+        extra = ""
+    else:
+        intro = (
+            "<p>Thank you sincerely for your generous donation (Rs. {0}) to <b>{1}</b>.</p>"
+        ).format(si.grand_total, escape_html(si.company))
+        extra = "<p>Payment Mode: {0}</p><p>Payment Reference: {1}</p>".format(
+            escape_html(payment_mode), escape_html(pe.reference_no)
+        )
+
+    return (
+        "<p>Dear {0},</p>{1}<p>Your donation receipt is attached to this email.</p>{2}"
+        "<p>With gratitude,<br>{3}</p>"
+    ).format(escape_html(si.customer_name), intro, extra, escape_html(si.company))

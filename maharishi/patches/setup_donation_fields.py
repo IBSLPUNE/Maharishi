@@ -106,6 +106,12 @@ def execute():
                 "fieldtype": "Data",
                 "insert_after": "custom_easebuzz_txnid",
             },
+            {
+                "fieldname": "custom_in_kind_details",
+                "label": "In-Kind Donation Details",
+                "fieldtype": "Small Text",
+                "insert_after": "custom_razorpay_order_id",
+            },
         ],
 
         "Payment Entry": [
